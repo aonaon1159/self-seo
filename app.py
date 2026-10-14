@@ -147,6 +147,8 @@ def dfs_post(path, payload):
         raise RuntimeError("ยังไม่ได้ตั้งค่า DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD")
     r = requests.post("https://api.dataforseo.com/v3/" + path, json=[payload],
                       auth=(DFS_LOGIN, DFS_PASS), timeout=60)
+    if r.status_code == 401:
+        raise RuntimeError("DataForSEO ปฏิเสธ login/password (401) ต้องใช้ API login และ API password จากหน้า API Access ไม่ใช่รหัสล็อกอินเว็บ")
     r.raise_for_status()
     task = r.json()["tasks"][0]
     if task["status_code"] != 20000:
@@ -179,6 +181,22 @@ def gap(me, rival, loc, lang):
                      "cpc": kd["keyword_info"].get("cpc") or 0, "me": mine, "rival": theirs,
                      "kind": "both" if mine and theirs else ("gap" if theirs else "mine")})
     return rows
+
+
+@app.get("/api/dfs/status")
+def dfs_status():
+    if not (DFS_LOGIN and DFS_PASS):
+        return jsonify(ok=False, message="ยังไม่ได้ตั้ง DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD " + (
+            "(ตั้งในแท็บ Variables ของ Railway แล้วกด Deploy)" if ON_RAILWAY else "(ต้องตั้งใน terminal เดียวกับที่รัน app.py)"))
+    try:
+        r = requests.get("https://api.dataforseo.com/v3/appendix/user_data", auth=(DFS_LOGIN, DFS_PASS), timeout=15)
+        if r.status_code == 401:
+            return jsonify(ok=False, message="login/password ไม่ถูกต้อง ต้องใช้ API login และ API password จากหน้า API Access")
+        r.raise_for_status()
+        money = r.json()["tasks"][0]["result"][0].get("money") or {}
+        return jsonify(ok=True, balance=money.get("balance"))
+    except Exception as e:
+        return jsonify(ok=False, message=f"เชื่อมต่อไม่ได้: {e}")
 
 
 # ---------- คีย์เวิร์ด ----------
@@ -300,7 +318,7 @@ def audit_safe(d):
 
 def overview(domain, loc, lang):
     """ทราฟฟิก organic รายเดือนย้อนหลัง 12 เดือน + backlinks ของเว็บหนึ่ง"""
-    o = {"history": [], "traffic": None, "keywords": None, "backlinks": None}
+    o = {"history": [], "traffic": None, "keywords": None, "backlinks": None, "error": None}
     try:
         res = dfs_post("dataforseo_labs/google/historical_rank_overview/live",
                        {"target": domain, "location_code": loc, "language_code": lang})
@@ -313,8 +331,10 @@ def overview(domain, loc, lang):
         o["history"] = hist[-12:]
         if hist:
             o["traffic"], o["keywords"] = hist[-1]["etv"], hist[-1]["count"]
-    except Exception:
-        pass
+        else:
+            o["error"] = "DataForSEO ไม่มีข้อมูลทราฟฟิกของเว็บนี้ (เว็บเล็กหรือใหม่มักยังไม่ถูกเก็บ)"
+    except Exception as e:
+        o["error"] = str(e)[:200]
     try:  # ต้องมีสิทธิ์ Backlinks API ถ้าไม่มีจะเป็น None
         o["backlinks"] = dfs_post("backlinks/summary/live", {"target": domain})[0].get("backlinks")
     except Exception:
@@ -952,7 +972,7 @@ body{background:#fff}.side,.top{display:none!important}.shell{display:block}main
 <div class="shell"><aside class="side"><div class="logo">SEO ส่วนตัว</div>
 <div class="pbox"><label for="proj">โปรเจ็กต์</label><select id="proj"></select>
 <div class="pact"><button class="sm" id="pnew">+ ใหม่</button><button class="sm" id="pedit">แก้ไข</button></div></div>
-<p class="info" id="info"></p>
+<p class="info" id="info"></p><p class="info" id="dfs"></p>
 <nav><button aria-selected="true" data-t="dash">ภาพรวม</button><button aria-selected="false" data-t="todo">สิ่งที่ควรทำ</button><button aria-selected="false" data-t="audit">Site Audit</button><button aria-selected="false" data-t="rank">ติดตามอันดับ</button><button aria-selected="false" data-t="kw">หาคีย์เวิร์ด</button>
 <button aria-selected="false" data-t="saved">คีย์เวิร์ดที่บันทึก</button><button aria-selected="false" data-t="cmp">เปรียบเทียบคู่แข่ง</button><button aria-selected="false" data-t="ideas">ไอเดียคอนเทนต์</button><button aria-selected="false" data-t="pages">หน้ายอดนิยม</button><button aria-selected="false" data-t="report">รายงาน</button></nav></aside>
 <div class="content"><main>
@@ -1076,7 +1096,8 @@ $("#iclose").onclick=()=>$("#idlg").close();
 const COL=["var(--brand)","#f59e0b","#10b981","#3b82f6","#8b5cf6","#ec4899"],MON=["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."];
 function chart(ov,doms){
  const ser=doms.map(x=>(ov[x]||{}).history||[]),yms=[...new Set(ser.flat().map(x=>x.ym))].sort().slice(-12);
- if(!yms.length)return '<p class="msg">ยังไม่มีข้อมูลทราฟฟิกย้อนหลัง (ต้องตั้งค่า DataForSEO และเว็บต้องมีข้อมูลในฐานข้อมูลของเขา)</p>';
+ if(!yms.length){const m={};doms.forEach(x=>{const e=ov[x]&&ov[x].error;if(e)(m[e]=m[e]||[]).push(x)});const er=Object.entries(m).map(([e,ds])=>`<li>${esc(e)} <span class="cap">(${ds.map(esc).join(", ")})</span></li>`).join("");
+  return '<p class="msg">ยังไม่มีข้อมูลทราฟฟิกย้อนหลัง</p>'+(er?`<ul class="msg">${er}</ul>`:'<p class="msg">กด "เปรียบเทียบกับคู่แข่งทั้งหมด" อีกครั้งเพื่อให้ระบบบันทึกสาเหตุ และดูสถานะการเชื่อมต่อ DataForSEO ที่เมนูซ้ายล่าง</p>')}
  const vals=ser.map(s=>yms.map(m=>(s.find(x=>x.ym===m)||{}).etv||0)),mx=Math.max(4,...vals.flat());
  const r=mx/4,pw=10**Math.floor(Math.log10(r)),fr=r/pw,step=(fr<=1?1:fr<=2?2:fr<=5?5:10)*pw,top=step*Math.ceil(mx/step);
  const W=900,H=300,L=52,R=16,T=12,B=34,x=i=>L+(W-L-R)*(yms.length>1?i/(yms.length-1):.5),y=v=>T+(H-T-B)*(1-v/top);
@@ -1209,6 +1230,8 @@ function cmpRank(d){const c=d.compare||[];if(!c.length||!c[0].tracked||!d.days.l
  `</table></div><p class="cap" style="margin:8px 0 12px">ตัวเลขน้อยกว่า = อยู่สูงกว่า ดีกว่า คอลัมน์ "รวมคำที่ไม่ติด" นับคำที่ไม่ติดเป็นอันดับ ${d.depth+1} เพื่อเทียบเว็บที่ติดจำนวนคำไม่เท่ากันได้ยุติธรรมกว่า</p>`+
  (hh.length?`<div class="lbl">เทียบเฉพาะคำที่ทั้งสองเว็บติดอันดับ</div><div class="wrap"><table><tr><th>คู่แข่ง</th><th class="n">จำนวนคำ</th><th class="n">อันดับเฉลี่ยเรา</th><th class="n">อันดับเฉลี่ยคู่แข่ง</th><th class="n">เราสูงกว่า / ต่ำกว่า</th></tr>`+hh.map(x=>{const h=x.h2h;return `<tr><td>${esc(x.domain)}</td><td class="n">${h.common}</td><td class="n ${h.me_avg<h.rival_avg?"win":""}">${h.me_avg}</td><td class="n ${h.rival_avg<h.me_avg?"lose":""}">${h.rival_avg}</td><td class="n">${h.me_wins} / ${h.rival_wins}</td></tr>`}).join("")+"</table></div>":"")+
  `<div class="lbl" style="margin-top:16px">อันดับเฉลี่ยตามเวลา (รวมคำที่ไม่ติด ตำแหน่งยิ่งอยู่สูงยิ่งดี)</div>${lc(d.days,Object.entries(d.trend).map(([n,v])=>({name:n,vals:v.map(x=>x.avg_all)})),true)}</div>`}
+async function refreshDfs(){try{const d=await api("/api/dfs/status");$("#dfs").innerHTML=d.ok?`DataForSEO: เชื่อมต่อแล้ว${d.balance!=null?` (เครดิตคงเหลือ $${Number(d.balance).toFixed(2)})`:""}`:`<span class="err">DataForSEO: ${esc(d.message)}</span>`}catch(e){}}
+refreshDfs();
 load();
 </script></body></html>"""
 
