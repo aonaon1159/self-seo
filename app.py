@@ -11,7 +11,7 @@
       (ตั้ง APP_PASSWORD ถ้าอยากให้ถามรหัสผ่านก่อนเข้าเว็บ ส่วนขึ้น Railway ดู README.md)
 """
 import csv, hmac, io, json, os, re, sqlite3, threading, time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin, urldefrag
@@ -199,6 +199,86 @@ def dfs_status():
         return jsonify(ok=False, message=f"เชื่อมต่อไม่ได้: {e}")
 
 
+# ---------- Google Search Console (ฟรี ใช้ได้เฉพาะเว็บของเราเอง) ----------
+# ใส่ไฟล์ JSON ของ service account ทั้งไฟล์ใน GSC_CREDENTIALS_JSON แล้วเพิ่มอีเมล service account เป็นผู้ใช้ใน Search Console
+GSC_JSON = os.getenv("GSC_CREDENTIALS_JSON")
+GSC_API = "https://www.googleapis.com/webmasters/v3/"
+_gsc = {}
+
+
+def gsc_session():
+    if not GSC_JSON:
+        raise RuntimeError("ยังไม่ได้ตั้ง GSC_CREDENTIALS_JSON")
+    if "s" not in _gsc:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import AuthorizedSession
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(GSC_JSON), scopes=["https://www.googleapis.com/auth/webmasters.readonly"])
+        _gsc["s"], _gsc["email"] = AuthorizedSession(creds), creds.service_account_email
+    return _gsc["s"]
+
+
+def gsc_site(domain):
+    """หา property ใน Search Console ที่ตรงกับโดเมน (รองรับทั้งแบบ Domain และ URL prefix)"""
+    r = gsc_session().get(GSC_API + "sites", timeout=20)
+    r.raise_for_status()
+    sites = [s["siteUrl"] for s in r.json().get("siteEntry", []) if s.get("permissionLevel") != "siteUnverifiedUser"]
+    for s in sites:
+        if (s[len("sc-domain:"):] if s.startswith("sc-domain:") else host(s)) == domain:
+            return s
+    raise RuntimeError(f"Search Console ยังไม่ได้ให้สิทธิ์เว็บ {domain} กับ {_gsc.get('email')} "
+                       "(เพิ่มอีเมลนี้เป็นผู้ใช้ใน Search Console > การตั้งค่า > ผู้ใช้และสิทธิ์)")
+
+
+def gsc_query(site, body):
+    r = gsc_session().post(GSC_API + "sites/" + requests.utils.quote(site, safe="") + "/searchAnalytics/query",
+                           json=body, timeout=60)
+    if r.status_code == 403:
+        raise RuntimeError(f"Search Console ไม่อนุญาต ({_gsc.get('email')} ต้องเป็นผู้ใช้ของเว็บนี้)")
+    r.raise_for_status()
+    return r.json().get("rows") or []
+
+
+def gsc_history(domain):
+    """คลิกรายเดือนย้อนหลัง (ไม่นับเดือนปัจจุบันที่ยังไม่จบ) ในรูปแบบเดียวกับ overview()"""
+    site, today = gsc_site(domain), datetime.now(TZ).date()
+    start = today.replace(day=1, year=today.year - 1)  # วันที่ 1 ของเดือนเดียวกันปีก่อน = ครบ 12 เดือนเต็ม
+    rows = gsc_query(site, {"startDate": start.isoformat(), "endDate": today.isoformat(), "dimensions": ["date"], "rowLimit": 25000})
+    months = {}
+    for r in rows:
+        ym = r["keys"][0][:7]
+        months[ym] = months.get(ym, 0) + r["clicks"]
+    this = today.strftime("%Y-%m")
+    return [{"ym": ym, "etv": round(v), "count": None} for ym, v in sorted(months.items()) if ym != this][-12:]
+
+
+def gsc_pages(domain, limit=20):
+    """หน้าที่ได้คลิกมากที่สุด 28 วันล่าสุด + จำนวนคีย์เวิร์ดที่พาคนเข้าแต่ละหน้า"""
+    site, today = gsc_site(domain), datetime.now(TZ).date()
+    rng = {"startDate": date.fromordinal(today.toordinal() - 28).isoformat(), "endDate": today.isoformat()}
+    pages = gsc_query(site, {**rng, "dimensions": ["page"], "rowLimit": limit})
+    kw = {}
+    for r in gsc_query(site, {**rng, "dimensions": ["page", "query"], "rowLimit": 25000}):
+        kw[r["keys"][0]] = kw.get(r["keys"][0], 0) + 1
+    return [{"url": r["keys"][0], "traffic": round(r["clicks"]), "keywords": kw.get(r["keys"][0], 0),
+             "impressions": round(r["impressions"]), "position": round(r["position"], 1), "src": "gsc"} for r in pages]
+
+
+@app.get("/api/gsc/status")
+def gsc_status():
+    if not GSC_JSON:
+        return jsonify(ok=False, message="ยังไม่ได้ตั้ง GSC_CREDENTIALS_JSON " + (
+            "(ตั้งในแท็บ Variables ของ Railway แล้วกด Deploy)" if ON_RAILWAY else "(ต้องตั้งใน terminal เดียวกับที่รัน app.py)"))
+    p = get_project(request.args.get("project_id"))
+    try:
+        gsc_session()
+        if p:
+            gsc_site(p["domain"])
+        return jsonify(ok=True, email=_gsc.get("email"))
+    except Exception as e:
+        return jsonify(ok=False, message=str(e)[:300])
+
+
 # ---------- คีย์เวิร์ด ----------
 def suggest(args):
     q, lang = args
@@ -360,6 +440,14 @@ def api_compare():
         except Exception as e:
             note = f"ข้าม keyword gap: {e}"
             break
+    if GSC_JSON:  # เว็บของเราใช้คลิกจริงจาก Search Console แทนค่าประมาณ (ฟรี)
+        mine = ov[p["domain"]]
+        try:
+            hist = gsc_history(p["domain"])
+            if hist:
+                mine.update(history=hist, traffic=hist[-1]["etv"], error=None, source="gsc")
+        except Exception as e:
+            mine["error"] = (mine["error"] + " / " if mine.get("error") else "") + f"Search Console: {str(e)[:200]}"
     data = {"sites": sites, "gaps": gaps, "gap_note": note, "overview": ov}
     with db() as c:
         sid = c.execute("insert into snapshots(project_id,data) values(?,?)", (p["id"], json.dumps(data))).lastrowid
@@ -787,22 +875,31 @@ def toppages_run():
     p = get_project(request.json.get("project_id"))
     if not p:
         return jsonify(error="ไม่พบโปรเจ็กต์"), 404
-    errs = []
+    errs = {}
 
     def one(d):
         try:
+            if d == p["domain"] and GSC_JSON:  # เว็บเราใช้ Search Console (ฟรี) ก่อน
+                try:
+                    return d, gsc_pages(d)
+                except Exception as e:
+                    if not (DFS_LOGIN and DFS_PASS):
+                        raise RuntimeError(f"Search Console: {e}")
+            if not (DFS_LOGIN and DFS_PASS):
+                raise RuntimeError("ข้อมูลเว็บคู่แข่งต้องใช้ DataForSEO (Search Console ดูได้เฉพาะเว็บของเราเอง)"
+                                   if d != p["domain"] else "ยังไม่ได้ตั้ง GSC_CREDENTIALS_JSON หรือ DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD")
             return d, relevant_pages(d, p["location"], p["lang"])
         except Exception as e:
-            errs.append(str(e))
+            errs[d] = str(e)[:300]
             return d, None
     with ThreadPoolExecutor(4) as ex:
         res = [x for x in ex.map(one, [p["domain"]] + p["competitors"]) if x[1] is not None]
     if not res:
-        return jsonify(error=f"ดึงข้อมูลไม่สำเร็จ: {errs[0] if errs else 'ไม่ทราบสาเหตุ'}"), 400
+        return jsonify(error=f"ดึงข้อมูลไม่สำเร็จ: {errs.get(p['domain']) or next(iter(errs.values()), 'ไม่ทราบสาเหตุ')}", errors=errs), 400
     with db() as c:
         for d, pg in res:
             c.execute("insert or replace into toppages values(?,?,?,datetime('now'))", (p["id"], d, json.dumps(pg)))
-    return jsonify(ok=len(res))
+    return jsonify(ok=len(res), errors=errs)
 
 
 @app.get("/api/toppages")
@@ -972,7 +1069,7 @@ body{background:#fff}.side,.top{display:none!important}.shell{display:block}main
 <div class="shell"><aside class="side"><div class="logo">SEO ส่วนตัว</div>
 <div class="pbox"><label for="proj">โปรเจ็กต์</label><select id="proj"></select>
 <div class="pact"><button class="sm" id="pnew">+ ใหม่</button><button class="sm" id="pedit">แก้ไข</button></div></div>
-<p class="info" id="info"></p><p class="info" id="dfs"></p>
+<p class="info" id="info"></p><p class="info" id="dfs"></p><p class="info" id="gsc"></p>
 <nav><button aria-selected="true" data-t="dash">ภาพรวม</button><button aria-selected="false" data-t="todo">สิ่งที่ควรทำ</button><button aria-selected="false" data-t="audit">Site Audit</button><button aria-selected="false" data-t="rank">ติดตามอันดับ</button><button aria-selected="false" data-t="kw">หาคีย์เวิร์ด</button>
 <button aria-selected="false" data-t="saved">คีย์เวิร์ดที่บันทึก</button><button aria-selected="false" data-t="cmp">เปรียบเทียบคู่แข่ง</button><button aria-selected="false" data-t="ideas">ไอเดียคอนเทนต์</button><button aria-selected="false" data-t="pages">หน้ายอดนิยม</button><button aria-selected="false" data-t="report">รายงาน</button></nav></aside>
 <div class="content"><main>
@@ -1016,7 +1113,7 @@ async function load(sel){
  $("#pedit").disabled=!cur;const p=proj();
  $("#info").textContent=p?`${p.domain}  |  ${C.find(c=>c[1]==p.location&&c[2]==p.lang)?.[0]||p.location}  |  คู่แข่ง ${p.competitors.length} เว็บ`:"สร้างโปรเจ็กต์แรกเพื่อเริ่มใช้งาน";
  $("#kout").innerHTML=p?"":noProj();$("#cout").innerHTML=p?"":noProj();KW=[];SNAP=null;$("#cover").innerHTML="";
- refreshSaved();refreshHist(true);refreshAudit();refreshRank();refreshDash();refreshSched();refreshPages();refreshTodo();refreshGapIdeas();if(!$('#report').hidden)buildReport()}
+ PERR={};refreshDfs();refreshSaved();refreshHist(true);refreshAudit();refreshRank();refreshDash();refreshSched();refreshPages();refreshTodo();refreshGapIdeas();if(!$('#report').hidden)buildReport()}
 $("#proj").onchange=e=>load(+e.target.value);
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>{document.querySelectorAll("nav button").forEach(x=>x.setAttribute("aria-selected",x===b));
  ["dash","todo","audit","rank","kw","ideas","saved","cmp","pages","report"].forEach(id=>$("#"+id).hidden=id!==b.dataset.t);({dash:()=>{refreshDash();refreshSched()},todo:refreshTodo,pages:refreshPages,report:buildReport,ideas:refreshGapIdeas}[b.dataset.t]||(()=>{}))()});
@@ -1106,7 +1203,7 @@ function chart(ov,doms){
  const paths=vals.map((v,k)=>{let d=`M${x(0)},${y(v[0])}`;for(let i=1;i<v.length;i++){const xm=(x(i-1)+x(i))/2;d+=`C${xm},${y(v[i-1])} ${xm},${y(v[i])} ${x(i)},${y(v[i])}`}
   return `<path d="${d}" fill="none" style="stroke:${COL[k%6]}" stroke-width="2.5" stroke-linecap="round"/>`}).reverse().join("");
  return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="กราฟทราฟฟิก Organic รายเดือนของเว็บคุณเทียบกับคู่แข่ง">${g}${paths}</svg>
- <div class="legend">${doms.map((d,k)=>`<span><i style="display:inline-block;width:18px;height:3px;background:${COL[k%6]};vertical-align:middle;margin-right:6px"></i>${esc(d)}${k?"":" (เรา)"}</span>`).join("")}</div>`}
+ <div class="legend">${doms.map((d,k)=>`<span><i style="display:inline-block;width:18px;height:3px;background:${COL[k%6]};vertical-align:middle;margin-right:6px"></i>${esc(d)}${k?"":" (เรา)"}${(ov[d]||{}).source==="gsc"?` <span class="cap">คลิกจริงจาก Search Console</span>`:""}</span>`).join("")}</div>`}
 function drawOverview(d){const p=proj(),ov=d.overview||{},co=p.competitors.filter(c=>d.gaps[c]||ov[c]||d.sites.some(s=>s.domain===c)),doms=[p.domain,...co];
  const cn=(C.find(c=>c[1]==p.location&&c[2]==p.lang)||[p.location])[0];
  const st=r=>{const g=d.gaps[r];return g?{both:g.filter(x=>x.kind==="both").length,gap:g.filter(x=>x.kind==="gap").length}:null};
@@ -1188,11 +1285,17 @@ async function refreshGapIdeas(){const o=$("#gapout");if(!cur){o.innerHTML="";re
 let TP={};
 async function refreshPages(){if(!cur){$("#pout").innerHTML=noProj();return}TP=await api("/api/toppages?project_id="+cur);const p=proj();
  $("#pdom").innerHTML=[p.domain,...p.competitors].map((d,i)=>`<option value="${esc(d)}">${i?"":"(เรา) "}${esc(d)}</option>`).join("");drawPages()}
-function drawPages(){const t=TP[$("#pdom").value],o=$("#pout");$("#pdate").textContent=t?"ดึงข้อมูลเมื่อ "+t.created:"";
- o.innerHTML=t?(t.pages.length?`<div class="wrap"><table><tr><th>หน้า</th><th class="n">ทราฟฟิกโดยประมาณ/เดือน</th><th class="n">คีย์เวิร์ดที่ติดอันดับ</th></tr>`+t.pages.map(x=>`<tr><td style="word-break:break-all"><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.url)}</a></td><td class="n">${num(x.traffic)}</td><td class="n">${num(x.keywords)}</td></tr>`).join("")+"</table></div>":'<p class="msg">ไม่พบข้อมูลของเว็บนี้</p>'):'<p class="msg">ยังไม่เคยดึงข้อมูล กด "ดึงข้อมูลใหม่"</p>'}
+let PERR={};
+function drawPages(){const d=$("#pdom").value,t=TP[d],o=$("#pout"),gsc=t&&t.pages.length&&t.pages[0].src==="gsc",lnk=x=>`<td style="word-break:break-all"><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.url)}</a></td>`;
+ $("#pdate").textContent=t?"ดึงข้อมูลเมื่อ "+t.created+(gsc?" (Search Console, 28 วันล่าสุด)":""):"";
+ const err=PERR[d]?`<p class="err">${esc(PERR[d])}</p>`:"";
+ o.innerHTML=err+(t?(t.pages.length?(gsc?`<div class="wrap"><table><tr><th>หน้า</th><th class="n">คลิก (28 วัน)</th><th class="n">การแสดงผล</th><th class="n">อันดับเฉลี่ย</th><th class="n">คีย์เวิร์ดที่พาคนเข้า</th></tr>`+t.pages.map(x=>`<tr>${lnk(x)}<td class="n">${num(x.traffic)}</td><td class="n">${num(x.impressions)}</td><td class="n">${x.position}</td><td class="n">${num(x.keywords)}</td></tr>`).join("")+"</table></div><p class='cap'>ข้อมูลจริงจาก Google Search Console</p>"
+ :`<div class="wrap"><table><tr><th>หน้า</th><th class="n">ทราฟฟิกโดยประมาณ/เดือน</th><th class="n">คีย์เวิร์ดที่ติดอันดับ</th></tr>`+t.pages.map(x=>`<tr>${lnk(x)}<td class="n">${num(x.traffic)}</td><td class="n">${num(x.keywords)}</td></tr>`).join("")+"</table></div>"):'<p class="msg">ไม่พบข้อมูลของเว็บนี้</p>'):(err?"":'<p class="msg">ยังไม่เคยดึงข้อมูล กด "ดึงข้อมูลใหม่"</p>'))}
 $("#pdom").onchange=drawPages;
-$("#prun").onclick=async()=>{if(!cur)return;if(!confirm(`ดึงหน้ายอดนิยมของ ${proj().competitors.length+1} เว็บ (คิดค่า API ต่อเว็บ) ดำเนินการต่อ?`))return;
- $("#pout").innerHTML='<p class="msg">กำลังดึงข้อมูล…</p>';try{await api("/api/toppages/run","POST",{project_id:cur});refreshPages()}catch(e){$("#pout").innerHTML=`<p class="err">${esc(e.message)}</p>`}};
+$("#prun").onclick=async()=>{if(!cur)return;if(!confirm(`ดึงหน้ายอดนิยมของ ${proj().competitors.length+1} เว็บ (เว็บเราใช้ Search Console ฟรี ถ้าตั้งไว้ ส่วนคู่แข่งคิดค่า DataForSEO ต่อเว็บ) ดำเนินการต่อ?`))return;
+ $("#pout").innerHTML='<p class="msg">กำลังดึงข้อมูล…</p>';
+ const r=await fetch("/api/toppages/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project_id:cur})}),d=await r.json().catch(()=>({}));
+ PERR=d.errors||{};if(!r.ok&&!d.errors){$("#pout").innerHTML=`<p class="err">${esc(d.error||"เกิดข้อผิดพลาด")}</p>`;return}refreshPages()};
 
 // ---- สิ่งที่ควรทำ ----
 async function refreshTodo(){const o=$("#tout");if(!cur)return o.innerHTML=noProj();const d=await api("/api/todo?project_id="+cur),n=d.items.filter(x=>x.done).length,pc=["","#ef4444","#f59e0b","#22c55e"],pl=["","สำคัญมาก","ควรทำ","ถ้ามีเวลา"];
@@ -1230,8 +1333,8 @@ function cmpRank(d){const c=d.compare||[];if(!c.length||!c[0].tracked||!d.days.l
  `</table></div><p class="cap" style="margin:8px 0 12px">ตัวเลขน้อยกว่า = อยู่สูงกว่า ดีกว่า คอลัมน์ "รวมคำที่ไม่ติด" นับคำที่ไม่ติดเป็นอันดับ ${d.depth+1} เพื่อเทียบเว็บที่ติดจำนวนคำไม่เท่ากันได้ยุติธรรมกว่า</p>`+
  (hh.length?`<div class="lbl">เทียบเฉพาะคำที่ทั้งสองเว็บติดอันดับ</div><div class="wrap"><table><tr><th>คู่แข่ง</th><th class="n">จำนวนคำ</th><th class="n">อันดับเฉลี่ยเรา</th><th class="n">อันดับเฉลี่ยคู่แข่ง</th><th class="n">เราสูงกว่า / ต่ำกว่า</th></tr>`+hh.map(x=>{const h=x.h2h;return `<tr><td>${esc(x.domain)}</td><td class="n">${h.common}</td><td class="n ${h.me_avg<h.rival_avg?"win":""}">${h.me_avg}</td><td class="n ${h.rival_avg<h.me_avg?"lose":""}">${h.rival_avg}</td><td class="n">${h.me_wins} / ${h.rival_wins}</td></tr>`}).join("")+"</table></div>":"")+
  `<div class="lbl" style="margin-top:16px">อันดับเฉลี่ยตามเวลา (รวมคำที่ไม่ติด ตำแหน่งยิ่งอยู่สูงยิ่งดี)</div>${lc(d.days,Object.entries(d.trend).map(([n,v])=>({name:n,vals:v.map(x=>x.avg_all)})),true)}</div>`}
-async function refreshDfs(){try{const d=await api("/api/dfs/status");$("#dfs").innerHTML=d.ok?`DataForSEO: เชื่อมต่อแล้ว${d.balance!=null?` (เครดิตคงเหลือ $${Number(d.balance).toFixed(2)})`:""}`:`<span class="err">DataForSEO: ${esc(d.message)}</span>`}catch(e){}}
-refreshDfs();
+async function refreshDfs(){try{const d=await api("/api/dfs/status");$("#dfs").innerHTML=d.ok?`DataForSEO: เชื่อมต่อแล้ว${d.balance!=null?` (เครดิตคงเหลือ $${Number(d.balance).toFixed(2)})`:""}`:`<span class="err">DataForSEO: ${esc(d.message)}</span>`}catch(e){}
+ try{const g=await api("/api/gsc/status"+(cur?"?project_id="+cur:""));$("#gsc").innerHTML=g.ok?`Search Console: เชื่อมต่อแล้ว (ฟรี)`:`<span class="cap">Search Console: ${esc(g.message)}</span>`}catch(e){}}
 load();
 </script></body></html>"""
 
