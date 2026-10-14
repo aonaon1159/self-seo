@@ -27,10 +27,13 @@ python3 -m venv .venv
    | `APP_USER` | ชื่อผู้ใช้เข้าเว็บ | ไม่จำเป็น (ค่าเริ่มต้น `admin`) |
    | `DATAFORSEO_LOGIN` | อีเมล API ของ DataForSEO | ไม่จำเป็น |
    | `DATAFORSEO_PASSWORD` | API password ของ DataForSEO | ไม่จำเป็น |
+   | `APP_TZ` | เขตเวลาของตารางรันอัตโนมัติ | ไม่จำเป็น (ค่าเริ่มต้น `Asia/Bangkok`) |
+   | `SEO_RANK_DEPTH` | ค้นหาอันดับลึกกี่อันดับ (ยิ่งลึกยิ่งเปลือง DataForSEO) | ไม่จำเป็น (ค่าเริ่มต้น `50`) |
 
 5. **Settings → Networking → Generate Domain** จะได้ลิงก์ `xxx.up.railway.app`
 6. เปิดลิงก์ เบราว์เซอร์จะถามชื่อผู้ใช้/รหัสผ่าน ให้ใส่ตามที่ตั้งในข้อ 4
 
 ### หมายเหตุ
 - ค่าตั้ง start command อยู่ใน `railway.json` (ใช้ gunicorn, 1 worker เพื่อให้ SQLite ปลอดภัย, timeout 10 นาทีเพราะการเทียบคู่แข่งใช้เวลานาน)
+- ตารางรันอัตโนมัติ (audit / เช็กอันดับ) ทำงานใน thread ของแอปเอง จึงต้องใช้ 1 worker ห้ามเพิ่ม `--workers` ไม่งั้นจะรันซ้ำ
 - อย่าใส่รหัสใดๆ ลงในโค้ดหรือ commit ขึ้น GitHub ให้ใส่ใน Variables ของ Railway เท่านั้น
