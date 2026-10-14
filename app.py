@@ -36,6 +36,8 @@ app = Flask(__name__)
 # ---------- รหัสผ่านเข้าเว็บ ----------
 @app.before_request
 def require_login():
+    if request.path == "/healthz":  # ให้ healthcheck ของ Railway ผ่านได้โดยไม่ต้องใช้รหัส
+        return None
     if not APP_PASSWORD:
         if ON_RAILWAY:  # กันลืมตั้งรหัสแล้วเว็บเปิดโล่ง
             return Response("ยังไม่ได้ตั้ง APP_PASSWORD ใน Variables ของ Railway", 503,
@@ -447,6 +449,11 @@ function drawGap(kind){const all=SNAP.gaps[$("#grival").value]||[],c=k=>all.filt
  (rows.map(r=>`<tr><td>${esc(r.keyword)}</td><td class="n">${num(r.volume)}</td><td class="n">${r.cpc.toFixed(2)}</td><td class="n ${r.me&&r.rival&&r.me<r.rival?"win":""}">${r.me||"-"}</td><td class="n ${r.me&&r.rival&&r.rival<r.me?"lose":""}">${r.rival||"-"}</td></tr>`).join("")||"<tr><td colspan=5>ไม่มีข้อมูล</td></tr>")}
 load();
 </script></body></html>"""
+
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
 
 
 @app.get("/")
