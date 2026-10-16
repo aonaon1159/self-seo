@@ -1191,7 +1191,13 @@ $("#aout").onclick=e=>{const i=e.target.dataset.iss;if(i==null||!AUD)return;cons
 $("#iclose").onclick=()=>$("#idlg").close();
 // ---- ภาพรวมคู่แข่ง: กราฟทราฟฟิก + ตารางคู่แข่งที่ติดตาม ----
 const COL=["var(--brand)","#f59e0b","#10b981","#3b82f6","#8b5cf6","#ec4899"],MON=["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."];
-function chart(ov,doms){
+// วาดเฉพาะเว็บที่มีข้อมูลจริง เว็บที่ไม่มีข้อมูลแสดงเป็นหมายเหตุแทน (ไม่วาดเป็นเส้น 0 ที่ทำให้เข้าใจผิด)
+function chart(ov,doms){const has=x=>((ov[x]||{}).history||[]).length>0,ok=doms.filter(has),miss=doms.filter(x=>!has(x));
+ if(!ok.length)return chartDraw(ov,doms);
+ const m={};miss.forEach(x=>{const e=(ov[x]&&ov[x].error)||"ไม่มีข้อมูล";(m[e]=m[e]||[]).push(x)});
+ return chartDraw(ov,ok)+(miss.length?`<p class="cap" style="margin-top:10px">ไม่ได้แสดงในกราฟเพราะไม่มีข้อมูล (ไม่ได้แปลว่าทราฟฟิกเป็น 0):</p><ul class="cap" style="margin:4px 0 0">`+
+  Object.entries(m).map(([e,ds])=>`<li>${ds.map(esc).join(", ")}: ${esc(e)}</li>`).join("")+"</ul>":"")}
+function chartDraw(ov,doms){
  const ser=doms.map(x=>(ov[x]||{}).history||[]),yms=[...new Set(ser.flat().map(x=>x.ym))].sort().slice(-12);
  if(!yms.length){const m={};doms.forEach(x=>{const e=ov[x]&&ov[x].error;if(e)(m[e]=m[e]||[]).push(x)});const er=Object.entries(m).map(([e,ds])=>`<li>${esc(e)} <span class="cap">(${ds.map(esc).join(", ")})</span></li>`).join("");
   return '<p class="msg">ยังไม่มีข้อมูลทราฟฟิกย้อนหลัง</p>'+(er?`<ul class="msg">${er}</ul>`:'<p class="msg">กด "เปรียบเทียบกับคู่แข่งทั้งหมด" อีกครั้งเพื่อให้ระบบบันทึกสาเหตุ และดูสถานะการเชื่อมต่อ DataForSEO ที่เมนูซ้ายล่าง</p>')}
